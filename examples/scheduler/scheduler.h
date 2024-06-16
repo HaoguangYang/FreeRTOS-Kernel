@@ -28,28 +28,60 @@
 #include "task.h"
 
 /* The scheduling policy can be chosen from one of these. */
-#define schedSCHEDULING_POLICY_MANUAL    0  /* The priority of tasks are set by the user. */
-#define schedSCHEDULING_POLICY_RMS       1  /* Rate-monotonic scheduling */
-#define schedSCHEDULING_POLICY_DMS       2  /* Deadline-monotonic scheduling */
-#define schedSCHEDULING_POLICY_EDF       3  /* Earliest deadline first */
+/* The priority of tasks are set by the user. */
+#define schedSCHEDULING_POLICY_MANUAL    0
+/* Manual policy uses a round-robin scheduler (FreeRTOS default) */
+#define schedSCHEDULING_POLICY_RR        0
+/* Other implemented schedulers in this file */
+#define schedSCHEDULING_POLICY_RMS       1 /* Rate-monotonic scheduling */
+#define schedSCHEDULING_POLICY_DMS       2 /* Deadline-monotonic scheduling */
+#define schedSCHEDULING_POLICY_EDF       3 /* Earliest deadline first */
+
+/* NOTE: self-adaptation addition */
+#define schedENABLE_SELF_EVALUATION      1
+#define schedENABLE_SELF_ESTIMATION      1
+
+#define schedPERIODIC_TASK_AUTOSTART     0
 
 /* Configure scheduling policy by setting this define to the appropriate one. */
-#define schedSCHEDULING_POLICY           schedSCHEDULING_POLICY_EDF
+#ifdef configTASK_SCHED_POLICY
+    #define schedSCHEDULING_POLICY    configTASK_SCHED_POLICY
+#else
+    #define schedSCHEDULING_POLICY    0
+#endif
+
+/* Design rule check */
+#if ( ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS         \
+        || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS      \
+        || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF ) && \
+    !( configUSE_PREEMPTION ) )
+    #error A preemptive scheduling policy is selected, but configUSE_PREEMPTION is set 0
+#endif
+#ifndef configUSE_TICK_HOOK
+    #define configUSE_TICK_HOOK    1
+#elif ( configUSE_TICK_HOOK == 0 )
+    #error configUSE_TICK_HOOK must be configured to 1 to use this scheduler library.
+#endif
+
+/* TODO: design rule check for use_tick_hook */
 
 /* If the scheduling policy is EDF, the implementation can be chosen between
  * naive implementation or efficient implementation.
  *
  * Naive implementation: Large overhead during context switch.
- * Efficient implementation: Lower overhead during context switch, however trace macros needs to be configured. */
+ * Efficient implementation: Lower overhead during context switch, however
+ * trace macros needs to be configured. */
 #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
     /* One of these defines must be set to 1, and the other one must be set to 0. */
-    #define schedEDF_EFFICIENT    1                          /* Efficient EDF implementation. */
-    #define schedEDF_NAIVE        ( 1 - schedEDF_EFFICIENT ) /* Naive EDF implementation. */
+    /* Efficient EDF implementation. */
+    #define schedEDF_EFFICIENT    1
+    /* Naive EDF implementation. */
+    #define schedEDF_NAIVE        ( 1 - schedEDF_EFFICIENT )
 #endif
 
 /* Maximum number of periodic tasks that can be created. (Scheduler task is
  * not included, but Polling Server is included) */
-#define schedMAX_NUMBER_OF_PERIODIC_TASKS    10
+#define schedMAX_NUMBER_OF_PERIODIC_TASKS    100
 
 /* Set this define to 1 to enable aperiodic jobs. */
 #define schedUSE_APERIODIC_JOBS              1
@@ -82,7 +114,7 @@
 /* Set this define to 1 to enable Timing-Error-Detection for detecting tasks
  * that have exceeded their worst-case execution time. Tasks that have exceeded
  * their worst-case execution time will be preempted until next period. */
-#define schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME    1
+#define schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME    0
 
 #if ( schedUSE_POLLING_SERVER == 1 || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF || schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 || schedMAX_NUMBER_OF_SPORADIC_JOBS == 1 )
 
@@ -100,8 +132,12 @@
     #define schedSCHEDULER_PRIORITY           ( configMAX_PRIORITIES - 1 )
     /* Stack size of the scheduler task. */
     #define schedSCHEDULER_TASK_STACK_SIZE    1000
+
     /* The period of the scheduler task in software ticks. */
-    #define schedSCHEDULER_TASK_PERIOD        pdMS_TO_TICKS( 100 )
+
+    /* unless we want to specify another frequency for the scheduler, by
+     * default it will use configTICK_RATE_HZ */
+    /* #define schedSCHEDULER_TASK_PERIOD       pdMS_TO_TICKS( 100 ) */
 
     /* This define needs to be configured port specifically. For some ports
      * it is portYIELD_FROM_ISR and for others it is portEND_SWITCHING_ISR. */
@@ -129,6 +165,29 @@
 
 /* Functions that must be defined by trace macros if efficient EDF is used. */
 #if ( schedEDF_EFFICIENT == 1 )
+    #if ( configUSE_TRACE_FACILITY != 1 )
+        #error Must set configUSE_TRACE_FACILITY to 1 with schedEDF_EFFICIENT
+    #endif
+    #ifdef traceBLOCKING_ON_QUEUE_RECEIVE
+        #undef traceBLOCKING_ON_QUEUE_RECEIVE
+    #endif
+    #define traceBLOCKING_ON_QUEUE_RECEIVEE( xQueue )    vSchedulerBlockTrace()
+    #ifdef traceBLOCKING_ON_QUEUE_SEND
+        #undef traceBLOCKING_ON_QUEUE_SEND
+    #endif
+    #define traceBLOCKING_ON_QUEUE_SEND( xQueue )    vSchedulerBlockTrace()
+    #ifdef traceTASK_DELAY_UNTIL
+        #undef traceTASK_DELAY_UNTIL
+    #endif
+    #define traceTASK_DELAY_UNTIL()    vSchedulerBlockTrace()
+    #ifdef traceTASK_SUSPEND
+        #undef traceTASK_SUSPEND
+    #endif
+    #define traceTASK_SUSPEND( xTask )    vSchedulerSuspendTrace( xTask )
+    #ifdef traceMOVED_TASK_TO_READY_STATE
+        #undef traceMOVED_TASK_TO_READY_STATE
+    #endif
+    #define traceMOVED_TASK_TO_READY_STATE( xTask )    vSchedulerReadyTrace( xTask )
     /* traceTASK_DELAY_UNTIL must define this function.  */
     void vSchedulerSuspendTrace( TaskHandle_t xTaskHandle );
 
@@ -138,6 +197,8 @@
     /* traceTASK_SWITCHED_IN must define this function. */
     void vSchedulerReadyTrace( TaskHandle_t xTaskHandle );
 #endif /* schedEDF_EFFICIENT */
+
+typedef struct xExtended_TCB SchedTCB_t;
 
 /* This function must be called before any other function call from scheduler.h. */
 void vSchedulerInit( void );
@@ -167,7 +228,12 @@ void vSchedulerPeriodicTaskCreate( TaskFunction_t pvTaskCode,
                                    TickType_t xDeadlineTick );
 
 /* Deletes a periodic task associated with the given task handle. */
-void vSchedulerPeriodicTaskDelete( TaskHandle_t xTaskHandle );
+void vSchedulerPeriodicTaskDelete( TaskHandle_t taskHandle );
+
+void vSchedulerPeriodicTaskUpdate( TaskHandle_t taskHandle,
+                                   TickType_t xPeriodTick,
+                                   TickType_t xMaxExecTimeTick,
+                                   TickType_t xDeadlineTick );
 
 /* Starts scheduling tasks. */
 void vSchedulerStart( void );
@@ -203,5 +269,20 @@ void vSchedulerStart( void );
                                             TickType_t xMaxExecTimeTick,
                                             TickType_t xDeadlineTick );
 #endif /* schedUSE_SPORADIC_JOBS */
+
+TickType_t ulSchedulerPeriodicTaskGetPeriod( TaskHandle_t * taskHandle );
+
+#if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
+    UBaseType_t uxSchedulerPeriodicTaskGetMissed( TaskHandle_t * taskHandle );
+#endif
+
+TaskHandle_t pxGetTaskHandleByName( const char * name );
+
+void vPrintAllTaskNames( void );
+
+/* additional function that executes within the scheduler loop */
+/* NOTE: this function has a weak empty definition inside scheduler.c. */
+/* The user-space application may re-define this function API to implement their own logic */
+extern void vSchedSpinAlong( void );
 
 #endif /* SCHEDULER_H_ */

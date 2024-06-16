@@ -77,6 +77,8 @@
  * calculated from the configCPU_CLOCK_HZ value. */
 #define configTICK_RATE_HZ                         100
 
+#define configTASK_SCHED_POLICY                    schedSCHEDULING_POLICY_RMS
+
 /* Set configUSE_PREEMPTION to 1 to use pre-emptive scheduling.  Set
  * configUSE_PREEMPTION to 0 to use co-operative scheduling.
  * See https://www.freertos.org/single-core-amp-smp-rtos-scheduling.html. */
@@ -280,7 +282,7 @@
  * or heap_4.c are included in the build.  This value is defaulted to 4096 bytes but
  * it must be tailored to each application.  Note the heap will appear in the .bss
  * section.  See https://www.freertos.org/a00111.html. */
-#define configTOTAL_HEAP_SIZE                        0xFFFF /* 64kB */
+#define configTOTAL_HEAP_SIZE                        0x3FFFF /* 256kB */
 
 /* Set configAPPLICATION_ALLOCATED_HEAP to 1 to have the application allocate
  * the array used as the FreeRTOS heap.  Set to 0 to have the linker allocate the
@@ -331,7 +333,7 @@
  * build.  The application writer is responsible for providing the hook function
  * for any set to 1.  See https://www.freertos.org/a00016.html. */
 #define configUSE_IDLE_HOOK                   0
-#define configUSE_TICK_HOOK                   0
+#define configUSE_TICK_HOOK                   1
 #define configUSE_MALLOC_FAILED_HOOK          1
 #define configUSE_DAEMON_TASK_STARTUP_HOOK    0
 
@@ -662,7 +664,6 @@
 
 void vApplicationAssert( const char * pcFile,
                          uint32_t ulLine );
-
 void FreeRTOS_SetupTickInterrupt( void );
 #define configSETUP_TICK_INTERRUPT()    FreeRTOS_SetupTickInterrupt()
 
@@ -674,20 +675,38 @@ void FreeRTOS_ClearTickInterrupt( void );
  * #define portSET_INTERRUPT_MASK_FROM_ISR()	ulPortSetInterruptMask()
  */
 
-void vCONFIGURE_TIMER_FOR_RUN_TIME_STATS( void );
-#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()    vCONFIGURE_TIMER_FOR_RUN_TIME_STATS()
+/* for define configGENERATE_RUN_TIME_STATS = 1 */
+#define configRUN_TIME_COUNTER_TYPE    uint64_t
 
-#define configRUN_TIME_COUNTER_TYPE    uint32_t
 configRUN_TIME_COUNTER_TYPE xGET_RUN_TIME_COUNTER_VALUE( void );
-#define portGET_RUN_TIME_COUNTER_VALUE()    xGET_RUN_TIME_COUNTER_VALUE()
+#if ( configGENERATE_RUN_TIME_STATS == 1 )
+    void vCONFIGURE_TIMER_FOR_RUN_TIME_STATS( void );
+    #define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()    vCONFIGURE_TIMER_FOR_RUN_TIME_STATS()
+    #define portGET_RUN_TIME_COUNTER_VALUE()            xGET_RUN_TIME_COUNTER_VALUE()
+#endif
+
+void vPortUSleep( uint64_t uxMicrosec );
+void vPortUSleepCalibrate( void );
+#define usleep              vPortUSleep
+#define vUSleepCalibrate    vPortUSleepCalibrate
+
+#include <stdio.h>
+/* call is made with double brackets: configPRINTF((...)) */
+#define configPRINTF( X )    printf X
 
 #ifdef FREERTOS_ENABLE_TRACE
     #include "FreeRTOSSTMTrace.h"
 #endif /* FREERTOS_ENABLE_TRACE */
 
 /* Xilinx additional includes */
-/* #include "bspconfig.h" */
 #include "xparameters.h"
 #define configINTERRUPT_CONTROLLER_BASE_ADDRESS    ( XPAR_PS7_SCUGIC_0_DIST_BASEADDR )
+
+/* Command Line Interface */
+#define configCOMMAND_INT_MAX_OUTPUT_SIZE          1024
+
+/* malloc re-route */
+#define malloc                                     pvPortMalloc
+#define free                                       vPortFree
 
 #endif /* FREERTOS_CONFIG_H */

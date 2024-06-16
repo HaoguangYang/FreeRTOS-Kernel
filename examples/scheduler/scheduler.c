@@ -22,6 +22,7 @@
 
 #include "scheduler.h"
 #include <stdio.h>
+#include <string.h>
 
 #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
     #include "list.h"
@@ -36,13 +37,33 @@
         #define schedPRIORITY_NOT_RUNNING          tskIDLE_PRIORITY
     #endif /* schedEDF_EFFICIENT */
 #else
-    #define schedUSE_TCB_ARRAY                     1
+    #define schedUSE_TCB_SORTED_LIST               1
 #endif /* schedSCHEDULING_POLICY_EDF */
+
+/* This typedef extends eTaskState in task.h */
+typedef enum
+{
+    eTaskRunning = 0, /* A task is querying the state of itself, so must be running. */
+    eTaskReady,       /* The task being queried is in a ready or pending ready list. */
+    eTaskBlocked,     /* The task being queried is in the Blocked state -- for a periodic task this means it has finished a cycle. */
+    eTaskSuspended,   /* The task being queried is in the Suspended state, or is in the Blocked state with an infinite time out. */
+    eTaskDeleted,     /* The task being queried has been deleted, but its TCB has not yet been freed. */
+    eTaskInvalid,     /* Used as an 'invalid state' value. */
+    eTaskDeferred,
+    eTaskWCETExceeded,
+    eTaskDeadlineMissed
+} eSchedPeriodicTaskState;
 
 /* Extended Task control block for managing periodic tasks within this library. */
 typedef struct xExtended_TCB
 {
-    TaskFunction_t pvTaskCode;    /* Function pointer to the code that will be run periodically. */
+    TaskFunction_t pvTaskCode; /* Function pointer to the code that will be run periodically. */
+    #if ( schedENABLE_SELF_EVALUATION == 1 )
+        TaskFunction_t pvEvaluatorCode;
+    #endif
+    #if ( schedENABLE_SELF_ESTIMATION == 1 )
+        TaskFunction_t pvEstimatorCode;
+    #endif
     const char * pcName;          /* Name of the task. */
     UBaseType_t uxStackDepth;     /* Stack size of the task. */
     void * pvParameters;          /* Parameters to the task function. */
@@ -54,14 +75,21 @@ typedef struct xExtended_TCB
     TickType_t xPeriod;           /* Task period. */
     TickType_t xLastWakeTime;     /* Last time stamp when the task was running. */
     TickType_t xMaxExecTime;      /* Worst-case execution time of the task. */
-    TickType_t xExecTime;         /* Current execution time of the task. */
 
-    BaseType_t xWorkIsDone;       /* pdFALSE if the job is not finished, pdTRUE if the job is finished. */
+    /* NOTE: xExecTime is in timer ticks, used to detect deadline misses.
+     * It may not have the highest resolution.
+     * For max timing resolution, use ulTaskGetRunTimeCounter(TaskHandle_t) */
+    TickType_t xExecTime; /* Current execution time of the task. */
 
+    #if ( ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS ||   \
+            schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS ) && \
+    schedUSE_TCB_ARRAY )
+        BaseType_t xPriorityIsSet; /* pdTRUE if the priority is assigned. */
+    #endif
     #if ( schedUSE_TCB_ARRAY == 1 )
-        BaseType_t xPriorityIsSet;      /* pdTRUE if the priority is assigned. */
-        BaseType_t xInUse;              /* pdFALSE if this extended TCB is empty. */
-    #elif ( schedUSE_TCB_SORTED_LIST == 1 )
+        BaseType_t xInUse; /* pdFALSE if this extended TCB is empty. */
+    #endif
+    #if ( schedUSE_TCB_SORTED_LIST == 1 )
         ListItem_t xTCBListItem;        /* Used to reference TCB from the TCB list. */
         #if ( schedEDF_EFFICIENT == 1 )
             ListItem_t xTCBAllListItem; /* Extra list item for xTCBAllList. */
@@ -69,16 +97,17 @@ typedef struct xExtended_TCB
     #endif /* schedUSE_TCB_SORTED_LIST */
 
     #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
-        BaseType_t xExecutedOnce; /* pdTRUE if the task has executed once. */
+        UBaseType_t uxExecutedCycles; /* >0 if the task has executed once. */
+        UBaseType_t uxMissed;
     #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
 
     #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 || schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
-        TickType_t xAbsoluteUnblockTime; /* The task will be unblocked at this time if it is blocked by the scheduler task. */
     #endif /* schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME || schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
 
+    volatile eSchedPeriodicTaskState eState;
     #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
-        BaseType_t xSuspended;           /* pdTRUE if the task is suspended. */
-        BaseType_t xMaxExecTimeExceeded; /* pdTRUE when execTime exceeds maxExecTime. */
+        /* The task will be unblocked at this time if it is blocked by the scheduler task. */
+        TickType_t xAbsoluteUnblockTime;
     #endif /* schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME */
 
     #if ( schedUSE_POLLING_SERVER == 1 )
@@ -126,14 +155,16 @@ typedef struct xExtended_TCB
     static void prvAddTCBToList( SchedTCB_t * pxTCB );
     static void prvDeleteTCBFromList( SchedTCB_t * pxTCB );
 #endif /* schedUSE_TCB_ARRAY */
+static SchedTCB_t * prvGetTCBFromHandle( TaskHandle_t taskHandle );
 
 static TickType_t xSystemStartTime = 0;
 
 static void prvPeriodicTaskCode( void * pvParameters );
-static void prvCreateAllTasks( void );
+/* static void prvCreateAllTasks( void ); */
 
 
-#if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+#if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || \
+      schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
     static void prvSetFixedPriorities( void );
 #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
     static void prvInitEDF( void );
@@ -201,19 +232,21 @@ static SchedTCB_t xTCBArray[ schedMAX_NUMBER_OF_PERIODIC_TASKS ] = { 0 };
 /* Counter for number of periodic tasks. */
 static BaseType_t xTaskCounter = 0;
 #elif ( schedUSE_TCB_SORTED_LIST == 1 )
+    static List_t xTCBList;           /* Sorted linked list for all periodic tasks. */
+    static List_t * pxTCBList = NULL; /* Pointer to xTCBList. */
     #if ( schedEDF_NAIVE == 1 )
-        static List_t xTCBList;                                  /* Sorted linked list for all periodic tasks. */
-        static List_t xTCBTempList;                              /* A temporary list used for switching lists. */
-        static List_t xTCBOverflowedList;                        /* Sorted linked list for periodic tasks that have overflowed deadline. */
-        static List_t * pxTCBList = NULL;                        /* Pointer to xTCBList. */
-        static List_t * pxTCBTempList = NULL;                    /* Pointer to xTCBTempList. */
-        static List_t * pxTCBOverflowedList = NULL;              /* Pointer to xTCBOverflowedList. */
+        /* static List_t xTCBList;      / * Sorted linked list for all periodic tasks. * / */
+        static List_t xTCBTempList;                 /* A temporary list used for switching lists. */
+        static List_t xTCBOverflowedList;           /* Sorted linked list for periodic tasks that have overflowed deadline. */
+        /* static List_t * pxTCBList = NULL;                / * Pointer to xTCBList. * / */
+        static List_t * pxTCBTempList = NULL;       /* Pointer to xTCBTempList. */
+        static List_t * pxTCBOverflowedList = NULL; /* Pointer to xTCBOverflowedList. */
     #elif ( schedEDF_EFFICIENT == 1 )
-        static List_t xTCBListAll;                               /* Sorted linked list for all periodic tasks. */
+        /* static List_t xTCBListAll;   / * Sorted linked list for all periodic tasks. * / */
         static List_t xTCBBlockedList;                           /* Linked list for blocked periodic tasks. */
         static List_t xTCBReadyList;                             /* Sorted linked list for all ready periodic tasks. */
         static List_t xTCBOverflowedReadyList;                   /* Sorted linked list for all ready periodic tasks with overflowed deadline. */
-        static List_t * pxTCBListAll;                            /* Pointer to xTCBListAll. */
+        /* static List_t * pxTCBListAll;                    / * Pointer to xTCBListAll. * / */
         static List_t * pxTCBBlockedList = NULL;                 /* Pointer to xTCBBlockedList. */
         static List_t * pxTCBReadyList = NULL;                   /* Pointer to xTCBReadyList. */
         static List_t * pxTCBOverflowedReadyList = NULL;         /* Pointer to xTCBOverflowedReadyList. */
@@ -227,7 +260,9 @@ static BaseType_t xTaskCounter = 0;
 #endif /* schedUSE_TCB_ARRAY */
 
 #if ( schedUSE_SCHEDULER_TASK )
-    static TickType_t xSchedulerWakeCounter = 0;
+    #ifdef schedSCHEDULER_TASK_PERIOD
+        static TickType_t xSchedulerWakeCounter = 0;
+    #endif
     static TaskHandle_t xSchedulerHandle = NULL;
 #endif /* schedUSE_SCHEDULER_TASK */
 
@@ -260,6 +295,10 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
     #endif /* schedUSE_SPORADIC_JOBS */
 #endif /* schedUSE_POLLING_SERVER */
 
+void vSchedSpinAlong() __attribute__( ( weak ) );
+void vSchedSpinAlong()
+{
+}
 
 #if ( schedUSE_TCB_ARRAY == 1 )
     /* Returns index position in xTCBArray of TCB with same task handle as parameter. */
@@ -270,7 +309,8 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
 
         for( xIterator = 0; xIterator < schedMAX_NUMBER_OF_PERIODIC_TASKS; xIterator++ )
         {
-            if( ( pdTRUE == xTCBArray[ xIndex ].xInUse ) && ( *xTCBArray[ xIndex ].pxTaskHandle == xTaskHandle ) )
+            if( ( pdTRUE == xTCBArray[ xIndex ].xInUse ) &&
+                ( *xTCBArray[ xIndex ].pxTaskHandle == xTaskHandle ) )
             {
                 return xIndex;
             }
@@ -334,38 +374,53 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
         vListInitialiseItem( &pxTCB->xTCBListItem );
         /* Set owner of list item to the TCB. */
         listSET_LIST_ITEM_OWNER( &pxTCB->xTCBListItem, pxTCB );
-        /* List is sorted by absolute deadline value. */
-        listSET_LIST_ITEM_VALUE( &pxTCB->xTCBListItem, pxTCB->xAbsoluteDeadline );
 
-        #if ( schedEDF_EFFICIENT == 1 )
-            /* Initialise list item for xTCBListAll. */
-            vListInitialiseItem( &pxTCB->xTCBAllListItem );
-            /* Set owner of list item to the TCB. */
-            listSET_LIST_ITEM_OWNER( &pxTCB->xTCBAllListItem, pxTCB );
-            /* There is no need to sort the list. */
-        #endif /* schedEDF_EFFICIENT */
+        #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+            /* List is sorted by absolute deadline value. */
+            listSET_LIST_ITEM_VALUE( &pxTCB->xTCBListItem, pxTCB->xAbsoluteDeadline );
+            #if ( schedEDF_EFFICIENT == 1 )
+                /* Initialise list item for xTCBListAll. */
+                vListInitialiseItem( &pxTCB->xTCBAllListItem );
+                /* Set owner of list item to the TCB. */
+                listSET_LIST_ITEM_OWNER( &pxTCB->xTCBAllListItem, pxTCB );
+                /* There is no need to sort the list. */
+            #endif /* schedEDF_EFFICIENT */
+        #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS )
+            /* List is sorted by period. */
+            listSET_LIST_ITEM_VALUE( &pxTCB->xTCBListItem, pxTCB->xPeriod );
+        #else  /* if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS ) */
+            /* List is sorted by user-defined priority. */
+            listSET_LIST_ITEM_VALUE( &pxTCB->xTCBListItem, pxTCB->uxPriority );
+        #endif /* if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS ) */
 
-        #if ( schedEDF_NAIVE == 1 )
+        #if ( schedSCHEDULING_POLICY != schedSCHEDULING_POLICY_EDF || schedEDF_NAIVE == 1 )
             /* Insert TCB into list. */
             vListInsert( pxTCBList, &pxTCB->xTCBListItem );
-        #elif ( schedEDF_EFFICIENT == 1 )
+        #else
+            /* schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF && schedEDF_EFFICIENT == 1 */
             /* Insert TCB into ready list. */
             vListInsert( pxTCBReadyList, &pxTCB->xTCBListItem );
             /* Insert TCB into list containing tasks in any state. */
-            vListInsert( pxTCBListAll, &pxTCB->xTCBAllListItem );
-        #endif /* schedEDF_EFFICIENT */
+            vListInsert( pxTCBList, &pxTCB->xTCBAllListItem );
+        #endif
     }
 
     /* Delete an extended TCB from sorted linked list. */
     static void prvDeleteTCBFromList( SchedTCB_t * pxTCB )
     {
-        #if ( schedEDF_EFFICIENT == 1 )
+        #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF && schedEDF_EFFICIENT == 1 )
             uxListRemove( &pxTCB->xTCBAllListItem );
         #endif /* schedEDF_EFFICIENT */
         uxListRemove( &pxTCB->xTCBListItem );
         vPortFree( pxTCB );
     }
 #endif /* schedUSE_TCB_ARRAY */
+
+SchedTCB_t * prvGetTCBFromHandle( TaskHandle_t taskHandle )
+{
+    return ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer(
+        taskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX );
+}
 
 #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
     #if ( schedUSE_TCB_SORTED_LIST == 1 )
@@ -391,7 +446,8 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
                 ListItem_t * pxTCBListItem;
                 ListItem_t * pxTCBListItemTemp;
 
-                if( listLIST_IS_EMPTY( pxTCBList ) && !listLIST_IS_EMPTY( pxTCBOverflowedList ) )
+                if( listLIST_IS_EMPTY( pxTCBList ) &&
+                    !listLIST_IS_EMPTY( pxTCBOverflowedList ) )
                 {
                     prvSwapList( &pxTCBList, &pxTCBOverflowedList );
                 }
@@ -430,7 +486,8 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
                     BaseType_t xHighestPriority = configMAX_PRIORITIES - 1;
                 #endif /* schedUSE_SCHEDULER_TASK */
 
-                const ListItem_t * pxTCBListEndMarkerAfterSwap = listGET_END_MARKER( pxTCBList );
+                const ListItem_t * pxTCBListEndMarkerAfterSwap =
+                    listGET_END_MARKER( pxTCBList );
                 pxTCBListItem = listGET_HEAD_ENTRY( pxTCBList );
 
                 while( pxTCBListItem != pxTCBListEndMarkerAfterSwap )
@@ -464,7 +521,8 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
             }
 
             /* If ready list is empty and overflowed ready list is not, swap those. */
-            if( listLIST_IS_EMPTY( pxTCBReadyList ) && !listLIST_IS_EMPTY( pxTCBOverflowedReadyList ) )
+            if( listLIST_IS_EMPTY( pxTCBReadyList ) &&
+                !listLIST_IS_EMPTY( pxTCBOverflowedReadyList ) )
             {
                 prvSwapList( &pxTCBReadyList, &pxTCBOverflowedReadyList );
             }
@@ -485,7 +543,8 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
  *          }
  */
 
-            if( ( NULL == pxCurrentTCB ) || ( ( signed ) ( pxCurrentTCB->xAbsoluteDeadline - pxTCB->xAbsoluteDeadline ) > 0 ) )
+            if( ( NULL == pxCurrentTCB ) || ( ( signed ) (
+                                                  pxCurrentTCB->xAbsoluteDeadline > pxTCB->xAbsoluteDeadline ) > 0 ) )
             {
                 if( NULL != pxCurrentTCB )
                 {
@@ -501,7 +560,8 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
         /* Called when a task is blocked. */
         void vSchedulerBlockTrace( void )
         {
-            if( ( NULL != pxCurrentTCB ) && ( xTaskGetCurrentTaskHandle() == *pxCurrentTCB->pxTaskHandle ) )
+            if( ( NULL != pxCurrentTCB ) &&
+                ( xTaskGetCurrentTaskHandle() == *pxCurrentTCB->pxTaskHandle ) )
             {
                 /* Remove current task from ready list. */
                 uxListRemove( &pxCurrentTCB->xTCBListItem );
@@ -516,9 +576,9 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
         }
 
         /* Called when a task is suspended. */
-        void vSchedulerSuspendTrace( TaskHandle_t xTaskHandle )
+        void vSchedulerSuspendTrace( TaskHandle_t taskHandle )
         {
-            SchedTCB_t * pxTCBToSuspend = ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX );
+            SchedTCB_t * pxTCBToSuspend = prvGetTCBFromHandle( taskHandle );
 
             if( NULL != pxTCBToSuspend )
             {
@@ -538,9 +598,10 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
         }
 
         /* Called when a task becomes ready. */
-        void vSchedulerReadyTrace( TaskHandle_t xTaskHandle )
+        void vSchedulerReadyTrace( TaskHandle_t taskHandle )
         {
-            if( ( xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED ) || ( xTaskHandle == xSchedulerHandle ) )
+            if( ( xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED ) ||
+                ( taskHandle == xSchedulerHandle ) )
             {
                 return;
             }
@@ -553,7 +614,7 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
                 }
             #endif /* configUSE_TIMERS */
 
-            SchedTCB_t * pxTCBReady = ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX );
+            SchedTCB_t * pxTCBReady = prvGetTCBFromHandle( taskHandle );
 
             if( NULL != pxTCBReady )
             {
@@ -567,7 +628,7 @@ static TickType_t xAbsolutePreviousMaxResponseTime = 0;
  * This function wraps the task code specified by the user. */
 static void prvPeriodicTaskCode( void * pvParameters )
 {
-    SchedTCB_t * pxThisTask = ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xTaskGetCurrentTaskHandle(), schedTHREAD_LOCAL_STORAGE_POINTER_INDEX );
+    SchedTCB_t * pxThisTask = prvGetTCBFromHandle( xTaskGetCurrentTaskHandle() );
 
     configASSERT( NULL != pxThisTask );
 
@@ -575,36 +636,44 @@ static void prvPeriodicTaskCode( void * pvParameters )
     {
         ( void ) xTaskDelayUntil( &pxThisTask->xLastWakeTime, pxThisTask->xReleaseTime );
     }
-
-    #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
-        pxThisTask->xExecutedOnce = pdTRUE;
-    #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
-
-    if( 0 == pxThisTask->xReleaseTime )
+    else
     {
         pxThisTask->xLastWakeTime = xSystemStartTime;
     }
 
     for( ; ; )
     {
+        pxThisTask->xExecTime = 0;
+        pxThisTask->eState = eTaskReady;
+        #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
+            pxThisTask->uxExecutedCycles++;
+        #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
         #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
             #if ( schedEDF_NAIVE == 1 )
                 /* Wake up the scheduler task to update priorities of all periodic tasks. */
                 prvWakeScheduler();
             #endif /* schedEDF_NAIVE */
         #endif /* schedSCHEDULING_POLICY_EDF */
-        pxThisTask->xWorkIsDone = pdFALSE;
 
         /*
          * taskENTER_CRITICAL();
-         * printf( "tickcount %d Task %s Abs deadline %d lastWakeTime %d prio %d Handle %x\r\n", xTaskGetTickCount(), pxThisTask->pcName, pxThisTask->xAbsoluteDeadline, pxThisTask->xLastWakeTime, uxTaskPriorityGet( NULL ), *pxThisTask->pxTaskHandle );
+         * printf( "tickcount %d Task %s Abs deadline %d lastWakeTime %d prio %d Handle %x\r\n",
+         *      xTaskGetTickCount(), pxThisTask->pcName, pxThisTask->xAbsoluteDeadline,
+         *      pxThisTask->xLastWakeTime, uxTaskPriorityGet( NULL ), *pxThisTask->pxTaskHandle );
          * taskEXIT_CRITICAL();
          */
 
-        /* Execute the task function specified by the user. */
+        /* NOTE: Execute the task function specified by the user. */
+        pxThisTask->eState = eTaskRunning;
         pxThisTask->pvTaskCode( pvParameters );
 
-        pxThisTask->xWorkIsDone = pdTRUE;
+        #if ( schedENABLE_SELF_EVALUATION == 1 )
+            if( pxThisTask->pvEvaluatorCode )
+            {
+                pxThisTask->pvEvaluatorCode( pvParameters );
+            }
+        #endif
+        pxThisTask->eState = eTaskBlocked;
 
         /*
          * taskENTER_CRITICAL();
@@ -612,12 +681,12 @@ static void prvPeriodicTaskCode( void * pvParameters )
          * taskEXIT_CRITICAL();
          */
 
-        pxThisTask->xExecTime = 0;
-
         #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
-            pxThisTask->xAbsoluteDeadline = pxThisTask->xLastWakeTime + pxThisTask->xPeriod + pxThisTask->xRelativeDeadline;
+            pxThisTask->xAbsoluteDeadline = pxThisTask->xLastWakeTime +
+                                            pxThisTask->xPeriod + pxThisTask->xRelativeDeadline;
             #if ( schedEDF_EFFICIENT == 1 )
-                listSET_LIST_ITEM_VALUE( &pxThisTask->xTCBListItem, pxThisTask->xAbsoluteDeadline );
+                listSET_LIST_ITEM_VALUE(
+                    &pxThisTask->xTCBListItem, pxThisTask->xAbsoluteDeadline );
             #endif /* schedEDF_EFFICIENT */
 
             #if ( schedEDF_NAIVE == 1 )
@@ -626,7 +695,135 @@ static void prvPeriodicTaskCode( void * pvParameters )
             #endif /* schedEDF_NAIVE */
         #endif /* schedSCHEDULING_POLICY_EDF */
 
-        vTaskDelayUntil( &pxThisTask->xLastWakeTime, pxThisTask->xPeriod );
+        ( void ) xTaskDelayUntil( &pxThisTask->xLastWakeTime, pxThisTask->xPeriod );
+    }
+}
+
+#if 0
+/* Creates all periodic tasks stored in TCB array, or TCB list. */
+    static void prvCreateAllTasks( void )
+    {
+        SchedTCB_t * pxTCB;
+
+        #if ( schedUSE_TCB_ARRAY == 1 )
+            BaseType_t xIndex;
+
+            for( xIndex = 0; xIndex < xTaskCounter; xIndex++ )
+            {
+                configASSERT( pdTRUE == xTCBArray[ xIndex ].xInUse );
+                pxTCB = &xTCBArray[ xIndex ];
+
+                BaseType_t xReturnValue = xTaskCreate(
+                    prvPeriodicTaskCode,
+                    pxTCB->pcName,
+                    pxTCB->uxStackDepth,
+                    pxTCB->pvParameters,
+                    pxTCB->uxPriority,
+                    pxTCB->pxTaskHandle );
+
+                configASSERT( pdPASS == xReturnValue );
+                vTaskSetThreadLocalStoragePointer( *pxTCB->pxTaskHandle,
+                                                   schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, pxTCB );
+                #if ( schedPERIODIC_TASK_AUTOTART == 0 )
+                    /* all tasks are created as suspended */
+                    vTaskSuspend( pxTCB->pxTaskHandle );
+                    pxTCB->eState = eTaskSuspended;
+                #else
+                    pxTCB->eState = eTaskReady;
+                #endif
+            }
+        #elif ( schedUSE_TCB_SORTED_LIST == 1 )
+            const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBList );
+            ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBList );
+
+            while( pxTCBListItem != pxTCBListEndMarker )
+            {
+                pxTCB = listGET_LIST_ITEM_OWNER( pxTCBListItem );
+                configASSERT( NULL != pxTCB );
+
+                /* NOTE: creation of the task inside the RTOS */
+
+                /* FIXME: configASSERT(scheduler is not running || this task priority >= pxTCB->uxPriority)
+                 * NOTE: newly created task gets pushed to the ready queue directly.
+                 * If the round-robin sched (kernel sched) is running,
+                 * the newly created task will run its first cycle immediately if it has the highest priority.
+                 * because it is by default added to the ready queue (task.c, line 2087).
+                 * However, its local storage pointer is still unset (NULL), causing the first cycle to fail. */
+                BaseType_t xReturnValue = xTaskCreate(
+                    prvPeriodicTaskCode,
+                    pxTCB->pcName,
+                    pxTCB->uxStackDepth,
+                    pxTCB->pvParameters,
+                    pxTCB->uxPriority,
+                    pxTCB->pxTaskHandle );
+
+                configASSERT( pdPASS == xReturnValue );
+                /* the tcb is stored with the task handle, providing */
+                /* the associated function pointers and memory space */
+                vTaskSetThreadLocalStoragePointer( *( pxTCB->pxTaskHandle ),
+                                                   schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, pxTCB );
+                pxTCBListItem = listGET_NEXT( pxTCBListItem );
+
+                #if ( schedPERIODIC_TASK_AUTOTART == 0 )
+                    /* all tasks are created as suspended */
+                    vTaskSuspend( *( pxTCB->pxTaskHandle ) );
+                    pxTCB->eState = eTaskSuspended;
+                #else
+                    pxTCB->eState = eTaskReady;
+                #endif
+            }
+        #endif /* schedUSE_TCB_ARRAY */
+    }
+#endif /* if 0 */
+
+static void prvCreateTask( SchedTCB_t * pxTCB )
+{
+    #if ( schedUSE_TCB_ARRAY == 1 )
+        configASSERT( pdTRUE == pxTCB->xInUse );
+    #elif ( schedUSE_TCB_SORTED_LIST == 1 )
+        configASSERT( NULL != pxTCB );
+    #endif
+    /* NOTE: creation of the task inside the RTOS */
+
+    /* FIXME: configASSERT(scheduler is not running || this task priority >= pxTCB->uxPriority)
+     * NOTE: newly created task gets pushed to the ready queue directly.
+     * If the round-robin sched (kernel sched) is running,
+     * the newly created task will run its first cycle immediately if it has the highest priority.
+     * because it is by default added to the ready queue (task.c, line 2087).
+     * However, its local storage pointer is still unset (NULL), causing the first cycle to fail. */
+    /* prevents task switching at this point */
+    UBaseType_t uxSchedRunning = ( xTaskGetSchedulerState() == taskSCHEDULER_RUNNING );
+
+    if( uxSchedRunning )
+    {
+        vTaskSuspendAll();
+    }
+
+    BaseType_t xReturnValue = xTaskCreate(
+        prvPeriodicTaskCode,
+        pxTCB->pcName,
+        pxTCB->uxStackDepth,
+        pxTCB->pvParameters,
+        pxTCB->uxPriority,
+        pxTCB->pxTaskHandle );
+
+    configASSERT( pdPASS == xReturnValue );
+    /* the tcb is stored with the task handle, providing */
+    /* the associated function pointers and memory space */
+    vTaskSetThreadLocalStoragePointer( *( pxTCB->pxTaskHandle ),
+                                       schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, pxTCB );
+    #if ( schedPERIODIC_TASK_AUTOTART == 0 )
+        /* all tasks are created as suspended */
+        vTaskSuspend( *( pxTCB->pxTaskHandle ) );
+        pxTCB->eState = eTaskSuspended;
+    #else
+        pxTCB->eState = eTaskReady;
+    #endif
+
+    /* resumes scheduler */
+    if( uxSchedRunning )
+    {
+        ( void ) xTaskResumeAll();
     }
 }
 
@@ -642,9 +839,9 @@ void vSchedulerPeriodicTaskCreate( TaskFunction_t pvTaskCode,
                                    TickType_t xMaxExecTimeTick,
                                    TickType_t xDeadlineTick )
 {
-    taskENTER_CRITICAL();
     SchedTCB_t * pxNewTCB;
 
+    taskENTER_CRITICAL();
     #if ( schedUSE_TCB_ARRAY == 1 )
         BaseType_t xIndex = prvFindEmptyElementIndexTCB();
         configASSERT( xTaskCounter < schedMAX_NUMBER_OF_PERIODIC_TASKS );
@@ -654,27 +851,40 @@ void vSchedulerPeriodicTaskCreate( TaskFunction_t pvTaskCode,
         pxNewTCB = pvPortMalloc( sizeof( SchedTCB_t ) );
     #endif /* schedUSE_TCB_ARRAY */
 
-
     /* Intialize item. */
     *pxNewTCB = ( SchedTCB_t ) {
-        .pvTaskCode = pvTaskCode, .pcName = pcName, .uxStackDepth = uxStackDepth, .pvParameters = pvParameters,
-        .uxPriority = uxPriority, .pxTaskHandle = pxCreatedTask, .xReleaseTime = xPhaseTick, .xPeriod = xPeriodTick, .xMaxExecTime = xMaxExecTimeTick,
-        .xRelativeDeadline = xDeadlineTick, .xWorkIsDone = pdTRUE, .xExecTime = 0
+        .pvTaskCode = pvTaskCode,
+        .pcName = pcName,
+        .uxStackDepth = uxStackDepth,
+        .pvParameters = pvParameters,
+        .uxPriority = uxPriority,
+        .pxTaskHandle = pxCreatedTask,
+        .xReleaseTime = xPhaseTick,
+        .xPeriod = xPeriodTick,
+        .xMaxExecTime = xMaxExecTimeTick,
+        .xRelativeDeadline = xDeadlineTick,
+        .xExecTime = 0,
+        .eState = eTaskInvalid
     };
     #if ( schedUSE_TCB_ARRAY == 1 )
         pxNewTCB->xInUse = pdTRUE;
     #endif /* schedUSE_TCB_ARRAY */
 
-    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+    #if ( ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS ||   \
+            schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS ) && \
+    schedUSE_TCB_ARRAY )
         pxNewTCB->xPriorityIsSet = pdFALSE;
-    #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_MANUAL )
-        pxNewTCB->xPriorityIsSet = pdTRUE;
     #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
-        pxNewTCB->xAbsoluteDeadline = pxNewTCB->xRelativeDeadline + pxNewTCB->xReleaseTime + xSystemStartTime;
-        pxNewTCB->uxPriority = -1;
+        pxNewTCB->xAbsoluteDeadline = pxNewTCB->xRelativeDeadline +
+                                      pxNewTCB->xReleaseTime + xSystemStartTime;
+        #if ( schedEDF_EFFICIENT == 1 )
+            pxNewTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
+        #elif ( schedEDF_NAIVE == 1 ) /* schedEDF_EFFICIENT */
+            pxNewTCB->uxPriority = -1;
+        #endif /* schedEDF_NAIVE */
     #endif /* schedSCHEDULING_POLICY */
     #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
-        pxNewTCB->xExecutedOnce = pdFALSE;
+        pxNewTCB->uxExecutedCycles = 0;
     #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
     #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
         pxNewTCB->xSuspended = pdFALSE;
@@ -687,100 +897,96 @@ void vSchedulerPeriodicTaskCreate( TaskFunction_t pvTaskCode,
     #if ( schedUSE_TCB_ARRAY == 1 )
         xTaskCounter++;
     #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-        #if ( schedEDF_EFFICIENT == 1 )
-            pxNewTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
-        #endif /* schedEDF_EFFICIENT */
         prvAddTCBToList( pxNewTCB );
     #endif /* schedUSE_TCB_SORTED_LIST */
     taskEXIT_CRITICAL();
+    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || \
+          schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+        /*taskENTER_CRITICAL(); */
+        prvSetFixedPriorities();
+        /*taskEXIT_CRITICAL(); */
+    #endif
+    prvCreateTask( pxNewTCB );
+    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
+        if( xTaskGetSchedulerState() == taskSCHEDULER_RUNNING )
+        {
+            /* Wake up the scheduler task to update priorities of all periodic tasks. */
+            prvWakeScheduler();
+        }
+    #endif /* schedSCHEDULING_POLICY_EDF */
 }
 
 /* Deletes a periodic task. */
-void vSchedulerPeriodicTaskDelete( TaskHandle_t xTaskHandle )
+void vSchedulerPeriodicTaskDelete( TaskHandle_t taskHandle )
 {
-    if( xTaskHandle != NULL )
+    if( taskHandle != NULL )
     {
         #if ( schedUSE_TCB_ARRAY == 1 )
-            prvDeleteTCBFromArray( prvGetTCBIndexFromHandle( xTaskHandle ) );
+            prvDeleteTCBFromArray( prvGetTCBIndexFromHandle( taskHandle ) );
         #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-            prvDeleteTCBFromList( ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX ) );
+            prvDeleteTCBFromList( prvGetTCBFromHandle( taskHandle ) );
         #endif /* schedUSE_TCB_ARRAY */
     }
     else
     {
         #if ( schedUSE_TCB_ARRAY == 1 )
-            prvDeleteTCBFromArray( prvGetTCBIndexFromHandle( xTaskGetCurrentTaskHandle() ) );
+            prvDeleteTCBFromArray(
+                prvGetTCBIndexFromHandle( xTaskGetCurrentTaskHandle() ) );
         #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-            prvDeleteTCBFromList( ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xTaskGetCurrentTaskHandle(), schedTHREAD_LOCAL_STORAGE_POINTER_INDEX ) );
+            prvDeleteTCBFromList( prvGetTCBFromHandle(
+                                      xTaskGetCurrentTaskHandle() ) );
         #endif /* schedUSE_TCB_ARRAY */
     }
 
-    vTaskDelete( xTaskHandle );
+    vTaskDelete( taskHandle );
 }
 
-/* Creates all periodic tasks stored in TCB array, or TCB list. */
-static void prvCreateAllTasks( void )
+void vSchedulerPeriodicTaskUpdate( TaskHandle_t taskHandle,
+                                   TickType_t xPeriodTick,
+                                   TickType_t xMaxExecTimeTick,
+                                   TickType_t xDeadlineTick )
 {
-    SchedTCB_t * pxTCB;
+    SchedTCB_t * tcb = prvGetTCBFromHandle( taskHandle );
 
-    #if ( schedUSE_TCB_ARRAY == 1 )
-        BaseType_t xIndex;
-
-        for( xIndex = 0; xIndex < xTaskCounter; xIndex++ )
-        {
-            configASSERT( pdTRUE == xTCBArray[ xIndex ].xInUse );
-            pxTCB = &xTCBArray[ xIndex ];
-
-            BaseType_t xReturnValue = xTaskCreate( prvPeriodicTaskCode, pxTCB->pcName, pxTCB->uxStackDepth, pxTCB->pvParameters, pxTCB->uxPriority, pxTCB->pxTaskHandle );
-
-            if( pdPASS == xReturnValue )
-            {
-                vTaskSetThreadLocalStoragePointer( *pxTCB->pxTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, pxTCB );
-            }
-            else
-            {
-                /* if task creation failed */
-            }
-        }
-    #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-        #if ( schedEDF_NAIVE == 1 )
-            const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBList );
-            ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBList );
-        #elif ( schedEDF_EFFICIENT == 1 )
-            const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBListAll );
-            ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBListAll );
-        #endif /* schedEDF_EFFICIENT */
-
-        while( pxTCBListItem != pxTCBListEndMarker )
-        {
-            pxTCB = listGET_LIST_ITEM_OWNER( pxTCBListItem );
-            configASSERT( NULL != pxTCB );
-
-            BaseType_t xReturnValue = xTaskCreate( prvPeriodicTaskCode, pxTCB->pcName, pxTCB->uxStackDepth, pxTCB->pvParameters, pxTCB->uxPriority, pxTCB->pxTaskHandle );
-
-            if( pdPASS == xReturnValue )
-            {
-            }
-            else
-            {
-                /* if task creation failed */
-            }
-
-            vTaskSetThreadLocalStoragePointer( *pxTCB->pxTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, pxTCB );
-            pxTCBListItem = listGET_NEXT( pxTCBListItem );
-        }
-    #endif /* schedUSE_TCB_ARRAY */
+    configASSERT( NULL != tcb );
+    /* ISR should NOT kick in */
+    taskENTER_CRITICAL();
+    tcb->xPeriod = xPeriodTick;
+    tcb->xMaxExecTime = xMaxExecTimeTick;
+    tcb->xRelativeDeadline = xDeadlineTick;
+    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || \
+          schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+        prvSetFixedPriorities();
+    #endif
+    taskEXIT_CRITICAL();
 }
 
-#if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+TickType_t ulSchedulerPeriodicTaskGetPeriod( TaskHandle_t * taskHandle )
+{
+    SchedTCB_t * tcb = prvGetTCBFromHandle( *taskHandle );
+
+    configASSERT( NULL != tcb );
+    return tcb->xPeriod;
+}
+
+#if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
+    UBaseType_t uxSchedulerPeriodicTaskGetMissed( TaskHandle_t * taskHandle )
+    {
+        SchedTCB_t * tcb = prvGetTCBFromHandle( *taskHandle );
+
+        configASSERT( NULL != tcb );
+        return tcb->uxMissed;
+    }
+#endif
+
+#if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || \
+      schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
 
     /* Initiazes fixed priorities of all periodic tasks with respect to RMS or
      * DMS policy. */
     static void prvSetFixedPriorities( void )
     {
-        BaseType_t xIter, xIndex;
-        TickType_t xShortest, xPreviousShortest = 0;
-        SchedTCB_t * pxShortestTaskPointer, * pxTCB;
+        SchedTCB_t * pxTCB;
 
         #if ( schedUSE_SCHEDULER_TASK == 1 )
             BaseType_t xHighestPriority = schedSCHEDULER_PRIORITY;
@@ -788,50 +994,91 @@ static void prvCreateAllTasks( void )
             BaseType_t xHighestPriority = configMAX_PRIORITIES;
         #endif /* schedUSE_SCHEDULER_TASK */
 
-        for( xIter = 0; xIter < xTaskCounter; xIter++ )
-        {
-            xShortest = portMAX_DELAY;
+        #if ( schedUSE_TCB_ARRAY == 1 )
+            TickType_t xShortest, xPreviousShortest = 0;
+            SchedTCB_t * pxShortestTaskPointer;
+            /* O(N^2) double for-loop across all tasks to find out period ranking for every task */
+            BaseType_t xIter, xIndex;
 
-            /* search for shortest period/deadline */
-            for( xIndex = 0; xIndex < xTaskCounter; xIndex++ )
+            for( xIter = 0; xIter < xTaskCounter; xIter++ )
             {
-                pxTCB = &xTCBArray[ xIndex ];
-                configASSERT( pdTRUE == pxTCB->xInUse );
+                xShortest = portMAX_DELAY;
 
-                if( pdTRUE == pxTCB->xPriorityIsSet )
+                /* search for shortest period/deadline */
+                for( xIndex = 0; xIndex < xTaskCounter; xIndex++ )
                 {
-                    continue;
+                    pxTCB = &xTCBArray[ xIndex ];
+                    configASSERT( pdTRUE == pxTCB->xInUse );
+
+                    if( pdTRUE == pxTCB->xPriorityIsSet )
+                    {
+                        continue;
+                    }
+
+                    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS )
+                        if( pxTCB->xPeriod <= xShortest )
+                        {
+                            xShortest = pxTCB->xPeriod;
+                            pxShortestTaskPointer = pxTCB;
+                        }
+                    #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+                        if( pxTCB->xRelativeDeadline <= xShortest )
+                        {
+                            xShortest = pxTCB->xRelativeDeadline;
+                            pxShortestTaskPointer = pxTCB;
+                        }
+                    #endif /* schedSCHEDULING_POLICY */
                 }
 
-                #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS )
-                    if( pxTCB->xPeriod <= xShortest )
-                    {
-                        xShortest = pxTCB->xPeriod;
-                        pxShortestTaskPointer = pxTCB;
-                    }
-                #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
-                    if( pxTCB->xRelativeDeadline <= xShortest )
-                    {
-                        xShortest = pxTCB->xRelativeDeadline;
-                        pxShortestTaskPointer = pxTCB;
-                    }
-                #endif /* schedSCHEDULING_POLICY */
+                configASSERT( -1 <= xHighestPriority );
+
+                if( xPreviousShortest != xShortest )
+                {
+                    /* this if condition is entered at least once for any tasks */
+                    xHighestPriority--;
+                }
+
+                /* set highest priority to task with xShortest period (the highest priority is configMAX_PRIORITIES-1) */
+                pxShortestTaskPointer->uxPriority = xHighestPriority;
+                pxShortestTaskPointer->xPriorityIsSet = pdTRUE;
+
+                xPreviousShortest = xShortest;
             }
+        #elif ( schedUSE_TCB_SORTED_LIST == 1 )
+            /* NOTE: pxTCBList is sorted in increasing order of period (decr order of priority) */
+            const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBList );
+            UBaseType_t uxLastItemValue = 0;
 
-            configASSERT( -1 <= xHighestPriority );
-
-            if( xPreviousShortest != xShortest )
+            for( ListItem_t * rankPtr = listGET_HEAD_ENTRY( pxTCBList );
+                 rankPtr != pxTCBListEndMarker;
+                 rankPtr = listGET_NEXT( rankPtr ) )
             {
-                xHighestPriority--;
+                /* do not decrease priority value if the next task have the same period or deadline */
+                UBaseType_t uxThisItemValue = listGET_LIST_ITEM_VALUE( rankPtr );
+
+                if( uxThisItemValue != uxLastItemValue )
+                {
+                    xHighestPriority--;
+                    uxLastItemValue = uxThisItemValue;
+                }
+
+                pxTCB = listGET_LIST_ITEM_OWNER( rankPtr );
+                configASSERT( NULL != pxTCB );
+                configASSERT( 0 <= xHighestPriority );
+
+                if( pxTCB->uxPriority != xHighestPriority )
+                {
+                    pxTCB->uxPriority = xHighestPriority;
+
+                    if( pxTCB->pxTaskHandle != NULL )
+                    {
+                        vTaskPrioritySet( *( pxTCB->pxTaskHandle ), pxTCB->uxPriority );
+                    }
+                }
             }
-
-            /* set highest priority to task with xShortest period (the highest priority is configMAX_PRIORITIES-1) */
-            pxShortestTaskPointer->uxPriority = xHighestPriority;
-            pxShortestTaskPointer->xPriorityIsSet = pdTRUE;
-
-            xPreviousShortest = xShortest;
-        }
+        #endif /* if ( schedUSE_TCB_ARRAY == 1 ) */
     }
+
 #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
     /* Initializes priorities of all periodic tasks with respect to EDF policy. */
     static void prvInitEDF( void )
@@ -858,6 +1105,7 @@ static void prvCreateAllTasks( void )
                 pxTCBListItem = listGET_NEXT( pxTCBListItem );
             }
         #elif ( schedEDF_EFFICIENT == 1 )
+            /* start first task in the list */
             ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBReadyList );
             pxCurrentTCB = listGET_LIST_ITEM_OWNER( pxTCBListItem );
             pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
@@ -871,14 +1119,21 @@ static void prvCreateAllTasks( void )
     /* Recreates a deleted task that still has its information left in the task array (or list). */
     static void prvPeriodicTaskRecreate( SchedTCB_t * pxTCB )
     {
-        BaseType_t xReturnValue = xTaskCreate( prvPeriodicTaskCode, pxTCB->pcName, pxTCB->uxStackDepth, pxTCB->pvParameters, pxTCB->uxPriority, pxTCB->pxTaskHandle );
+        BaseType_t xReturnValue = xTaskCreate(
+            prvPeriodicTaskCode,
+            pxTCB->pcName,
+            pxTCB->uxStackDepth,
+            pxTCB->pvParameters,
+            pxTCB->uxPriority,
+            pxTCB->pxTaskHandle );
 
         if( pdPASS == xReturnValue )
         {
-            vTaskSetThreadLocalStoragePointer( *pxTCB->pxTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, ( SchedTCB_t * ) pxTCB );
+            vTaskSetThreadLocalStoragePointer( *pxTCB->pxTaskHandle,
+                                               schedTHREAD_LOCAL_STORAGE_POINTER_INDEX, ( SchedTCB_t * ) pxTCB );
 
             /* This must be set to false so that the task does not miss the deadline immediately when it is created. */
-            pxTCB->xExecutedOnce = pdFALSE;
+            pxTCB->uxExecutedCycles = 0;
             #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
                 pxTCB->xSuspended = pdFALSE;
                 pxTCB->xMaxExecTimeExceeded = pdFALSE;
@@ -903,6 +1158,7 @@ static void prvCreateAllTasks( void )
         printf( "\r\ndeadline missed! %s tick %ld\r\n", pxTCB->pcName, xTickCount );
 
         /* Delete the pxTask and recreate it. */
+        pxTCB->uxMissed++;
         vTaskDelete( *pxTCB->pxTaskHandle );
         pxTCB->xExecTime = 0;
         prvPeriodicTaskRecreate( pxTCB );
@@ -920,7 +1176,8 @@ static void prvCreateAllTasks( void )
     static void prvCheckDeadline( SchedTCB_t * pxTCB,
                                   TickType_t xTickCount )
     {
-        if( ( NULL != pxTCB ) && ( pdFALSE == pxTCB->xWorkIsDone ) && ( pdTRUE == pxTCB->xExecutedOnce ) )
+        if( ( NULL != pxTCB ) && ( pxTCB->eState == eTaskBlocked ) &&
+            ( pxTCB->uxExecutedCycles > 0 ) )
         {
             /* Need to update absolute deadline if the scheduling policy is not EDF. */
             #if ( schedSCHEDULING_POLICY != schedSCHEDULING_POLICY_EDF )
@@ -940,7 +1197,8 @@ static void prvCreateAllTasks( void )
         /* Called when a deadline of a sporadic job is missed. */
         static void prvDeadlineMissedHookSporadicJob( BaseType_t xIndex )
         {
-            printf( "\r\ndeadline missed sporadic job! %s\r\n\r\n", xSJCBFifo[ xIndex ].pcName );
+            printf( "\r\ndeadline missed sporadic job! %s\r\n\r\n",
+                    xSJCBFifo[ xIndex ].pcName );
         }
 
         /* Checks if any sporadic job has missed it's deadline. */
@@ -950,7 +1208,8 @@ static void prvCreateAllTasks( void )
             {
                 BaseType_t xIndex;
 
-                for( xIndex = xSJCBFifoHead - 1; xIndex < uxSporadicJobCounter; xIndex++ )
+                for( xIndex = xSJCBFifoHead - 1; xIndex < uxSporadicJobCounter;
+                     xIndex++ )
                 {
                     if( -1 == xIndex )
                     {
@@ -982,24 +1241,31 @@ static void prvCreateAllTasks( void )
     static void prvExecTimeExceedHook( TickType_t xTickCount,
                                        SchedTCB_t * pxCurrentTask )
     {
-        printf( "\r\nworst case execution time exceeded! %s %ld %ld\r\n", pxCurrentTask->pcName, pxCurrentTask->xExecTime, xTickCount );
+        printf( "\r\nworst case execution time exceeded! %s %ld %ld\r\n",
+                pxCurrentTask->pcName, pxCurrentTask->xExecTime, xTickCount );
 
+        pxCurrentTask->eState = eTaskWCETExceeded;
+        /* NOTE: IMPORTANT -- This function is called from within the ISR, therefore */
+        /* suspending a task is unsafe. */
         pxCurrentTask->xMaxExecTimeExceeded = pdTRUE;
         /* Is not suspended yet, but will be suspended by the scheduler later. */
-        pxCurrentTask->xSuspended = pdTRUE;
-        pxCurrentTask->xAbsoluteUnblockTime = pxCurrentTask->xLastWakeTime + pxCurrentTask->xPeriod;
+        pxCurrentTask->xAbsoluteUnblockTime = pxCurrentTask->xLastWakeTime +
+                                              pxCurrentTask->xPeriod;
         pxCurrentTask->xExecTime = 0;
         #if ( schedUSE_POLLING_SERVER == 1 )
             if( pdTRUE == pxCurrentTask->xIsPeriodicServer )
             {
-                pxCurrentTask->xAbsoluteDeadline = pxCurrentTask->xAbsoluteUnblockTime + pxCurrentTask->xRelativeDeadline;
+                pxCurrentTask->xAbsoluteDeadline =
+                    pxCurrentTask->xAbsoluteUnblockTime +
+                    pxCurrentTask->xRelativeDeadline;
                 #if ( schedEDF_EFFICIENT == 1 )
-                    listSET_LIST_ITEM_VALUE( &pxCurrentTask->xTCBListItem, pxCurrentTask->xAbsoluteDeadline );
+                    listSET_LIST_ITEM_VALUE( &pxCurrentTask->xTCBListItem,
+                                             pxCurrentTask->xAbsoluteDeadline );
                 #endif /* schedEDF_EFFICIENT */
             }
         #endif /* schedUSE_POLLING_SERVER */
         BaseType_t xHigherPriorityTaskWoken;
-        vTaskNotifyGiveFromISR( xSchedulerHandle, &xHigherPriorityTaskWoken );
+        vTaskNotifyGiveIndexedFromISR( xSchedulerHandle, 0, &xHigherPriorityTaskWoken );
         schedYIELD_FROM_ISR( xHigherPriorityTaskWoken );
     }
 
@@ -1030,46 +1296,35 @@ static void prvCreateAllTasks( void )
                     #endif /* schedUSE_SPORADIC_JOBS */
                 }
                 else
-                {
-                    /* Since lastWakeTime is updated to next wake time when the task is delayed, tickCount > lastWakeTime implies that
-                     * the task has not finished it's job this period. */
-
-                    /* Using ICTOH method proposed by Carlini and Buttazzo, to check the condition unaffected by counter overflows. */
-                    if( ( signed ) ( xTickCount - pxTCB->xLastWakeTime ) > 0 )
-                    {
-                        pxTCB->xWorkIsDone = pdFALSE;
-                    }
-
-                    prvCheckDeadline( pxTCB, xTickCount );
-                }
-            #else  /* if ( schedUSE_POLLING_SERVER == 1 ) */
-                  /* Since lastWakeTime is updated to next wake time when the task is delayed, tickCount > lastWakeTime implies that
-                   * the task has not finished it's job this period. */
+            #endif /* schedUSE_POLLING_SERVER */
+            {
+                /* Since lastWakeTime is updated to next wake time when the task is delayed, tickCount > lastWakeTime implies that
+                 * the task has not finished it's job this period. */
 
                 /* Using ICTOH method proposed by Carlini and Buttazzo, to check the condition unaffected by counter overflows. */
                 if( ( signed ) ( xTickCount - pxTCB->xLastWakeTime ) > 0 )
                 {
-                    pxTCB->xWorkIsDone = pdFALSE;
+                    pxTCB->eState = eTaskReady;
                 }
+
                 prvCheckDeadline( pxTCB, xTickCount );
-            #endif /* schedUSE_POLLING_SERVER */
+            }
         #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
 
 
         #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
-            if( pdTRUE == pxTCB->xMaxExecTimeExceeded )
+            if( pxTCB->eState == eTaskWCETExceeded )
             {
-                pxTCB->xMaxExecTimeExceeded = pdFALSE;
                 vTaskSuspend( *pxTCB->pxTaskHandle );
+                pxTCB->eState = eTaskDeferred;
             }
 
-            if( pdTRUE == pxTCB->xSuspended )
+            if( pxTCB->eState == eTaskDeferred )
             {
                 /* Using ICTOH method proposed by Carlini and Buttazzo, to check whether absolute unblock time is reached. */
                 if( ( signed ) ( pxTCB->xAbsoluteUnblockTime - xTickCount ) <= 0 )
                 {
-                    pxTCB->xSuspended = pdFALSE;
-                    pxTCB->xLastWakeTime = xTickCount;
+                    pxTCB->eState = eTaskReady;
                     vTaskResume( *pxTCB->pxTaskHandle );
                 }
             }
@@ -1078,79 +1333,92 @@ static void prvCreateAllTasks( void )
         return;
     }
 
-    /* Function code for the scheduler task. */
+    static inline void prvEDFSchedCycle( void )
+    {
+        #if ( schedEDF_NAIVE == 1 )
+            prvUpdatePrioritiesEDF();
+        #elif ( schedEDF_EFFICIENT == 1 )
+            if( pdTRUE == xSwitchToSchedulerOnBlock )
+            {
+                if( NULL != pxPreviousTCB )
+                {
+                    vTaskPrioritySet( *pxPreviousTCB->pxTaskHandle,
+                                      schedPRIORITY_NOT_RUNNING );
+                    pxPreviousTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
+                }
+
+                if( !listLIST_IS_EMPTY( pxTCBReadyList ) )
+                {
+                    ListItem_t * pxListItem = listGET_HEAD_ENTRY( pxTCBReadyList );
+                    pxCurrentTCB = listGET_LIST_ITEM_OWNER( pxListItem );
+
+                    if( NULL != *pxCurrentTCB->pxTaskHandle )
+                    {
+                        vTaskPrioritySet( *pxCurrentTCB->pxTaskHandle,
+                                          schedPRIORITY_RUNNING );
+                        pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
+                    }
+                }
+
+                xSwitchToSchedulerOnBlock = pdFALSE;
+            }
+            else if( pdTRUE == xSwitchToSchedulerOnSuspend )
+            {
+                if( NULL != *pxPreviousTCB->pxTaskHandle )
+                {
+                    vTaskPrioritySet( *pxPreviousTCB->pxTaskHandle,
+                                      schedPRIORITY_NOT_RUNNING );
+                    pxPreviousTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
+                }
+
+                if( !listLIST_IS_EMPTY( pxTCBReadyList ) )
+                {
+                    ListItem_t * pxListItem = listGET_HEAD_ENTRY( pxTCBReadyList );
+                    pxCurrentTCB = listGET_LIST_ITEM_OWNER( pxListItem );
+
+                    if( NULL != *pxCurrentTCB->pxTaskHandle )
+                    {
+                        vTaskPrioritySet( *pxCurrentTCB->pxTaskHandle,
+                                          schedPRIORITY_RUNNING );
+                        pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
+                    }
+                }
+
+                xSwitchToSchedulerOnSuspend = pdFALSE;
+            }
+            else if( pdTRUE == xSwitchToSchedulerOnReady )
+            {
+                if( NULL != pxPreviousTCB )
+                {
+                    vTaskPrioritySet( *pxPreviousTCB->pxTaskHandle,
+                                      schedPRIORITY_NOT_RUNNING );
+                    pxPreviousTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
+                }
+
+                if( NULL != pxCurrentTCB )
+                {
+                    vTaskPrioritySet( *pxCurrentTCB->pxTaskHandle,
+                                      schedPRIORITY_RUNNING );
+                    pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
+                }
+
+                xSwitchToSchedulerOnReady = pdFALSE;
+            }
+        #endif /* schedEDF_EFFICIENT */
+    }
+
+    /* NOTE: Function code for the scheduler task. */
     static void prvSchedulerFunction( void )
     {
         for( ; ; )
         {
             #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
-                #if ( schedEDF_NAIVE == 1 )
-                    prvUpdatePrioritiesEDF();
-                #elif ( schedEDF_EFFICIENT == 1 )
-                    if( pdTRUE == xSwitchToSchedulerOnBlock )
-                    {
-                        if( NULL != pxPreviousTCB )
-                        {
-                            vTaskPrioritySet( *pxPreviousTCB->pxTaskHandle, schedPRIORITY_NOT_RUNNING );
-                            pxPreviousTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
-                        }
-
-                        if( !listLIST_IS_EMPTY( pxTCBReadyList ) )
-                        {
-                            ListItem_t * pxListItem = listGET_HEAD_ENTRY( pxTCBReadyList );
-                            pxCurrentTCB = listGET_LIST_ITEM_OWNER( pxListItem );
-
-                            if( NULL != *pxCurrentTCB->pxTaskHandle )
-                            {
-                                vTaskPrioritySet( *pxCurrentTCB->pxTaskHandle, schedPRIORITY_RUNNING );
-                                pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
-                            }
-                        }
-
-                        xSwitchToSchedulerOnBlock = pdFALSE;
-                    }
-                    else if( pdTRUE == xSwitchToSchedulerOnSuspend )
-                    {
-                        if( NULL != *pxPreviousTCB->pxTaskHandle )
-                        {
-                            vTaskPrioritySet( *pxPreviousTCB->pxTaskHandle, schedPRIORITY_NOT_RUNNING );
-                            pxPreviousTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
-                        }
-
-                        if( !listLIST_IS_EMPTY( pxTCBReadyList ) )
-                        {
-                            ListItem_t * pxListItem = listGET_HEAD_ENTRY( pxTCBReadyList );
-                            pxCurrentTCB = listGET_LIST_ITEM_OWNER( pxListItem );
-
-                            if( NULL != *pxCurrentTCB->pxTaskHandle )
-                            {
-                                vTaskPrioritySet( *pxCurrentTCB->pxTaskHandle, schedPRIORITY_RUNNING );
-                                pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
-                            }
-                        }
-
-                        xSwitchToSchedulerOnSuspend = pdFALSE;
-                    }
-                    else if( pdTRUE == xSwitchToSchedulerOnReady )
-                    {
-                        if( NULL != pxPreviousTCB )
-                        {
-                            vTaskPrioritySet( *pxPreviousTCB->pxTaskHandle, schedPRIORITY_NOT_RUNNING );
-                            pxPreviousTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
-                        }
-
-                        if( NULL != pxCurrentTCB )
-                        {
-                            vTaskPrioritySet( *pxCurrentTCB->pxTaskHandle, schedPRIORITY_RUNNING );
-                            pxCurrentTCB->uxPriority = schedPRIORITY_RUNNING;
-                        }
-
-                        xSwitchToSchedulerOnReady = pdFALSE;
-                    }
-                #endif /* schedEDF_EFFICIENT */
+                prvEDFSchedCycle();
             #endif /* schedSCHEDULING_POLICY_EDF */
 
-            #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 || schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
+            /* check timing error */
+            #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 || \
+                  schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
                 TickType_t xTickCount = xTaskGetTickCount();
                 SchedTCB_t * pxTCB;
 
@@ -1163,13 +1431,8 @@ static void prvCreateAllTasks( void )
                         prvSchedulerCheckTimingError( xTickCount, pxTCB );
                     }
                 #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-                    #if ( schedEDF_NAIVE == 1 )
-                        const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBList );
-                        ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBList );
-                    #elif ( schedEDF_EFFICIENT == 1 )
-                        const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBListAll );
-                        ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBListAll );
-                    #endif /* schedEDF_EFFICIENT */
+                    const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBList );
+                    ListItem_t * pxTCBListItem = listGET_HEAD_ENTRY( pxTCBList );
 
                     while( pxTCBListItem != pxTCBListEndMarker )
                     {
@@ -1182,14 +1445,24 @@ static void prvCreateAllTasks( void )
                 #endif /* schedUSE_TCB_SORTED_LIST */
             #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE || schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME */
 
-            ulTaskNotifyTake( pdTRUE, portMAX_DELAY );
+            /* spin additional (void*)(void) functions that maintains the system state (e.g. I/O status check) */
+            vSchedSpinAlong();
+
+            /* NOTE: scheduler is waiting for a notification at signal id 0 */
+            ulTaskNotifyTakeIndexed( 0, pdTRUE, portMAX_DELAY );
         }
     }
 
     /* Creates the scheduler task. */
     static void prvCreateSchedulerTask( void )
     {
-        xTaskCreate( ( TaskFunction_t ) prvSchedulerFunction, "Scheduler", schedSCHEDULER_TASK_STACK_SIZE, NULL, schedSCHEDULER_PRIORITY, &xSchedulerHandle );
+        xTaskCreate(
+            ( TaskFunction_t ) prvSchedulerFunction,
+            "Scheduler",
+            schedSCHEDULER_TASK_STACK_SIZE,
+            NULL,
+            schedSCHEDULER_PRIORITY,
+            &xSchedulerHandle );
     }
 #endif /* schedUSE_SCHEDULER_TASK */
 
@@ -1221,12 +1494,15 @@ static void prvCreateAllTasks( void )
              * for sporadic jobs. */
             if( schedPOLLING_SERVER_MAX_EXECUTION_TIME >= pxReturnValue->xMaxExecTime )
             {
-                xAbsolutePreviousMaxResponseTime = xTaskGetTickCount() + schedPOLLING_SERVER_PERIOD * 2;
+                xAbsolutePreviousMaxResponseTime = xTaskGetTickCount() +
+                                                   schedPOLLING_SERVER_PERIOD * 2;
             }
             else
             {
-                xAbsolutePreviousMaxResponseTime = xTaskGetTickCount() + schedPOLLING_SERVER_PERIOD +
-                                                   ( pxReturnValue->xMaxExecTime / schedPOLLING_SERVER_MAX_EXECUTION_TIME + 1 ) * schedPOLLING_SERVER_PERIOD;
+                xAbsolutePreviousMaxResponseTime = xTaskGetTickCount() +
+                                                   schedPOLLING_SERVER_PERIOD +
+                                                   ( pxReturnValue->xMaxExecTime / schedPOLLING_SERVER_MAX_EXECUTION_TIME + 1 )
+                                                   * schedPOLLING_SERVER_PERIOD;
             }
         #endif /* schedUSE_SPORADIC_JOBS */
 
@@ -1277,7 +1553,11 @@ static void prvCreateAllTasks( void )
 
         /* Add item to AJCBList. */
         *pxNewAJCB = ( AJCB_t ) {
-            .pvTaskCode = pvTaskCode, .pcName = pcName, .pvParameters = pvParameters, .xMaxExecTime = xMaxExecTimeTick, .xExecTime = 0,
+            .pvTaskCode = pvTaskCode,
+            .pcName = pcName,
+            .pvParameters = pvParameters,
+            .xMaxExecTime = xMaxExecTimeTick,
+            .xExecTime = 0,
         };
 
         uxAperiodicJobCounter++;
@@ -1358,7 +1638,8 @@ static void prvCreateAllTasks( void )
         }
         else
         {
-            xRelativeMaxResponseTime += schedPOLLING_SERVER_PERIOD + ( pxSporadicJob->xMaxExecTime / schedPOLLING_SERVER_MAX_EXECUTION_TIME + 1 )
+            xRelativeMaxResponseTime += schedPOLLING_SERVER_PERIOD +
+                                        ( pxSporadicJob->xMaxExecTime / schedPOLLING_SERVER_MAX_EXECUTION_TIME + 1 )
                                         * schedPOLLING_SERVER_PERIOD;
         }
 
@@ -1401,8 +1682,12 @@ static void prvCreateAllTasks( void )
 
         /* Add item to SJCBList. */
         *pxNewSJCB = ( SJCB_t ) {
-            .pvTaskCode = pvTaskCode, .pcName = pcName, .pvParameters = pvParameters, .xRelativeDeadline = xDeadlineTick,
-            .xMaxExecTime = xMaxExecTimeTick, .xExecTime = 0
+            .pvTaskCode = pvTaskCode,
+            .pcName = pcName,
+            .pvParameters = pvParameters,
+            .xRelativeDeadline = xDeadlineTick,
+            .xMaxExecTime = xMaxExecTimeTick,
+            .xExecTime = 0
         };
 
         #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
@@ -1450,10 +1735,12 @@ static void prvCreateAllTasks( void )
                 }
                 else
                 {
-                    /* Run sporadic job */
-                    pxCurrentSporadicJob->pvTaskCode( pxCurrentSporadicJob->pvParameters );
+                    /* NOTE: Run sporadic job */
+                    pxCurrentSporadicJob->pvTaskCode(
+                        pxCurrentSporadicJob->pvParameters );
 
-                    SchedTCB_t * pxThisTask = ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xTaskGetCurrentTaskHandle(), schedTHREAD_LOCAL_STORAGE_POINTER_INDEX );
+                    SchedTCB_t * pxThisTask = prvGetTCBFromHandle(
+                        xTaskGetCurrentTaskHandle() );
                     /* printf( "PS finished sporadic job tick %d abs deadline %d\r\n", xTaskGetTickCount(), pxThisTask->xAbsoluteDeadline, ); */
                     uxSporadicJobCounter--;
 
@@ -1476,7 +1763,7 @@ static void prvCreateAllTasks( void )
                 }
                 else
                 {
-                    /* Run aperiodic job */
+                    /* NOTE: Run aperiodic job */
                     pxCurrentAperiodicJob->pvTaskCode( pxCurrentAperiodicJob->pvParameters );
                     uxAperiodicJobCounter--;
                     #if ( schedUSE_SPORADIC_JOBS == 1 )
@@ -1490,51 +1777,28 @@ static void prvCreateAllTasks( void )
     /* Creates Polling Server as a periodic task. */
     void prvPollingServerCreate( void )
     {
-        taskENTER_CRITICAL();
-        SchedTCB_t * pxNewTCB;
-
-        #if ( schedUSE_TCB_ARRAY == 1 )
-            BaseType_t xIndex = prvFindEmptyElementIndexTCB();
-            configASSERT( xTaskCounter < schedMAX_NUMBER_OF_PERIODIC_TASKS );
-            configASSERT( xIndex != -1 );
-            pxNewTCB = &xTCBArray[ xIndex ];
-        #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-            pxNewTCB = pvPortMalloc( sizeof( SchedTCB_t ) );
-        #endif /* schedUSE_TCB_ARRAY */
-
-        /* Initialize item. */
-        *pxNewTCB = ( SchedTCB_t ) {
-            .pvTaskCode = ( TaskFunction_t ) prvPollingServerFunction, .pcName = "PS", .uxStackDepth = schedPOLLING_SERVER_STACK_SIZE, .pvParameters = NULL,
-            .pxTaskHandle = &xPollingServerHandle, .xReleaseTime = 0, .xPeriod = schedPOLLING_SERVER_PERIOD, .xMaxExecTime = schedPOLLING_SERVER_MAX_EXECUTION_TIME,
-            .xRelativeDeadline = schedPOLLING_SERVER_DEADLINE, .xWorkIsDone = pdTRUE, .xExecTime = 0, .xIsPeriodicServer = pdTRUE
-        };
-        #if ( schedUSE_TCB_ARRAY == 1 )
-            pxNewTCB->xInUse = pdTRUE;
-        #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-            pxNewTCB->xAbsoluteDeadline = pxNewTCB->xRelativeDeadline + xSystemStartTime;
-        #endif /* schedUSE_TCB_SORTED_LIST */
-
-        #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
-            pxNewTCB->xPriorityIsSet = pdFALSE;
-        #endif /* schedSCHEDULING_POLICY_RMS || schedSCHEDULING_POLICY_DMS */
-        #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_MANUAL )
-            pxNewTCB->uxPriority = schedPOLLING_SERVER_PRIORITY;
-            pxNewTCB->xPriorityIsSet = pdTRUE;
-        #endif /* schedSCHEDULING_POLICY_MANUAL */
-        #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
-            pxNewTCB->xSuspended = pdFALSE;
-            pxNewTCB->xMaxExecTimeExceeded = pdFALSE;
-        #endif /* schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME */
-
-        #if ( schedUSE_TCB_ARRAY == 1 )
-            xTaskCounter++;
-        #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-            #if ( schedEDF_EFFICIENT == 1 )
-                pxNewTCB->uxPriority = schedPRIORITY_NOT_RUNNING;
-            #endif /* schedEDF_EFFICIENT */
-            prvAddTCBToList( pxNewTCB );
-        #endif /* schedUSE_TCB_SORTED_LIST */
-        taskEXIT_CRITICAL();
+        vSchedulerPeriodicTaskCreate(
+            ( TaskFunction_t ) prvPollingServerFunction,
+            "PollingServer",
+            schedPOLLING_SERVER_STACK_SIZE,
+            NULL,
+            #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_MANUAL )
+                schedPOLLING_SERVER_PRIORITY,
+            #else
+                0, /* use lowest priority */
+            #endif
+            &xPollingServerHandle,
+            0,
+            schedPOLLING_SERVER_PERIOD,
+            schedPOLLING_SERVER_MAX_EXECUTION_TIME,
+            schedPOLLING_SERVER_DEADLINE
+            );
+        /* this is the polling server task */
+        SchedTCB_t * tcb = prvGetTCBFromHandle( xPollingServerHandle );
+        tcb->xIsPeriodicServer = pdTRUE;
+        #if ( schedPERIODIC_TASK_AUTOTART == 0 )
+            vTaskResume( *( tcb->pxTaskHandle ) );
+        #endif
     }
 
     /*
@@ -1552,19 +1816,23 @@ static void prvCreateAllTasks( void )
     {
         BaseType_t xHigherPriorityTaskWoken;
 
-        vTaskNotifyGiveFromISR( xSchedulerHandle, &xHigherPriorityTaskWoken );
+        /* NOTE: this wakes up the scheduler prvSchedulerFunction() at signal id 0 */
+        vTaskNotifyGiveIndexedFromISR( xSchedulerHandle, 0, &xHigherPriorityTaskWoken );
+        /* yield all other tasks with higher priority */
         schedYIELD_FROM_ISR( xHigherPriorityTaskWoken );
     }
 
-    /* Called every software tick. */
+    /* Called every timer tick (timer interrupt -> xTaskIncrementTick).
+     * Requires: configUSE_TICK_HOOK == 1 */
     void vApplicationTickHook( void )
     {
-        SchedTCB_t * pxCurrentTask;
         TaskHandle_t xCurrentTaskHandle = xTaskGetCurrentTaskHandle();
 
-        pxCurrentTask = ( SchedTCB_t * ) pvTaskGetThreadLocalStoragePointer( xCurrentTaskHandle, schedTHREAD_LOCAL_STORAGE_POINTER_INDEX );
+        SchedTCB_t * pxCurrentTask = prvGetTCBFromHandle( xCurrentTaskHandle );
 
-        if( ( NULL != pxCurrentTask ) && ( xCurrentTaskHandle != xSchedulerHandle ) && ( xCurrentTaskHandle != xTaskGetIdleTaskHandle() ) )
+        if( ( NULL != pxCurrentTask ) &&
+            ( xCurrentTaskHandle != xSchedulerHandle ) &&
+            ( xCurrentTaskHandle != xTaskGetIdleTaskHandle() ) )
         {
             pxCurrentTask->xExecTime++;
             #if ( schedUSE_TIMING_ERROR_DETECTION_EXECUTION_TIME == 1 )
@@ -1574,7 +1842,8 @@ static void prvCreateAllTasks( void )
                     {
                         if( pdFALSE == pxCurrentTask->xSuspended )
                         {
-                            prvExecTimeExceedHook( xTaskGetTickCountFromISR(), pxCurrentTask );
+                            prvExecTimeExceedHook( xTaskGetTickCountFromISR(),
+                                                   pxCurrentTask );
                         }
                     }
                 }
@@ -1582,11 +1851,13 @@ static void prvCreateAllTasks( void )
         }
 
         #if ( schedUSE_TIMING_ERROR_DETECTION_DEADLINE == 1 )
-            xSchedulerWakeCounter++;
+            /* unless specified, scheduler task is woken up every timer tick. */
+            #ifdef schedSCHEDULER_TASK_PERIOD
+                xSchedulerWakeCounter = ( xSchedulerWakeCounter + 1 ) % schedSCHEDULER_TASK_PERIOD;
 
-            if( xSchedulerWakeCounter == schedSCHEDULER_TASK_PERIOD )
+                if( xSchedulerWakeCounter == 0 )
+            #endif
             {
-                xSchedulerWakeCounter = 0;
                 prvWakeScheduler();
             }
         #endif /* schedUSE_TIMING_ERROR_DETECTION_DEADLINE */
@@ -1599,23 +1870,27 @@ void vSchedulerInit( void )
     #if ( schedUSE_TCB_ARRAY == 1 )
         prvInitTCBArray();
     #elif ( schedUSE_TCB_SORTED_LIST == 1 )
-        #if ( schedEDF_NAIVE == 1 )
-            vListInitialise( &xTCBList );
-            vListInitialise( &xTCBTempList );
-            vListInitialise( &xTCBOverflowedList );
-            pxTCBList = &xTCBList;
-            pxTCBTempList = &xTCBTempList;
-            pxTCBOverflowedList = &xTCBOverflowedList;
-        #elif ( schedEDF_EFFICIENT == 1 )
-            vListInitialise( &xTCBListAll );
-            vListInitialise( &xTCBBlockedList );
-            vListInitialise( &xTCBReadyList );
-            vListInitialise( &xTCBOverflowedReadyList );
-            pxTCBListAll = &xTCBListAll;
-            pxTCBBlockedList = &xTCBBlockedList;
-            pxTCBReadyList = &xTCBReadyList;
-            pxTCBOverflowedReadyList = &xTCBOverflowedReadyList;
-        #endif /* schedEDF_NAIVE */
+        vListInitialise( &xTCBList );
+        pxTCBList = &xTCBList;
+        #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
+            #if ( schedEDF_NAIVE == 1 )
+                /* vListInitialise( &xTCBList ); */
+                vListInitialise( &xTCBTempList );
+                vListInitialise( &xTCBOverflowedList );
+                /* pxTCBList = &xTCBList; */
+                pxTCBTempList = &xTCBTempList;
+                pxTCBOverflowedList = &xTCBOverflowedList;
+            #elif ( schedEDF_EFFICIENT == 1 )
+                /* vListInitialise( &xTCBListAll ); */
+                vListInitialise( &xTCBBlockedList );
+                vListInitialise( &xTCBReadyList );
+                vListInitialise( &xTCBOverflowedReadyList );
+                /* pxTCBListAll = &xTCBListAll; */
+                pxTCBBlockedList = &xTCBBlockedList;
+                pxTCBReadyList = &xTCBReadyList;
+                pxTCBOverflowedReadyList = &xTCBOverflowedReadyList;
+            #endif /* schedEDF_NAIVE */
+        #endif /* if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF ) */
     #endif /* schedUSE_TCB_ARRAY */
 }
 
@@ -1623,22 +1898,81 @@ void vSchedulerInit( void )
  * have been created with API function before calling this function. */
 void vSchedulerStart( void )
 {
-    #if ( schedUSE_POLLING_SERVER == 1 )
-        prvPollingServerCreate();
-    #endif /* schedUSE_POLLING_SERVER */
-
-    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
-        prvSetFixedPriorities();
-    #elif ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
-        prvInitEDF();
-    #endif /* schedSCHEDULING_POLICY */
-
     #if ( schedUSE_SCHEDULER_TASK == 1 )
         prvCreateSchedulerTask();
     #endif /* schedUSE_SCHEDULER_TASK */
 
-    prvCreateAllTasks();
+    /*
+     #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_RMS || \
+     *      schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_DMS )
+     *  prvSetFixedPriorities();
+     #elif ...
+     */
+    #if ( schedSCHEDULING_POLICY == schedSCHEDULING_POLICY_EDF )
+        prvInitEDF();
+    #endif /* schedSCHEDULING_POLICY */
+
+    /* prvCreateAllTasks(); */
 
     xSystemStartTime = xTaskGetTickCount();
     vTaskStartScheduler();
+
+    #if ( schedUSE_POLLING_SERVER == 1 )
+        prvPollingServerCreate();
+    #endif /* schedUSE_POLLING_SERVER */
+
+    vUSleepCalibrate();
+}
+
+TaskHandle_t pxGetTaskHandleByName( const char * name )
+{
+    TaskHandle_t task = NULL;
+    SchedTCB_t * tcb;
+
+    #if ( schedUSE_TCB_ARRAY == 1 )
+        static BaseType_t xIndex = 0;
+        BaseType_t xIterator;
+
+        for( xIterator = 0; xIterator < schedMAX_NUMBER_OF_PERIODIC_TASKS;
+             xIterator++ )
+        {
+            tcb = &( xTCBArray[ xIndex ] );
+
+            if( ( pdTRUE == tcb->xInUse ) &&
+                ( strcmp( tcb->pcName, name ) == 0 ) )
+            {
+                task = *( tcb->pxTaskHandle );
+                break;
+            }
+
+            xIndex++;
+
+            if( schedMAX_NUMBER_OF_PERIODIC_TASKS == xIndex )
+            {
+                xIndex = 0;
+            }
+        }
+    #elif ( schedUSE_TCB_SORTED_LIST == 1 )
+        const ListItem_t * pxTCBListEndMarker = listGET_END_MARKER( pxTCBList );
+        ListItem_t * pxTCBListItem;
+
+        for( pxTCBListItem = listGET_HEAD_ENTRY( pxTCBList );
+             pxTCBListItem != pxTCBListEndMarker;
+             pxTCBListItem = listGET_NEXT( pxTCBListItem ) )
+        {
+            tcb = listGET_LIST_ITEM_OWNER( pxTCBListItem );
+
+            if( strcmp( tcb->pcName, name ) == 0 )
+            {
+                task = *( tcb->pxTaskHandle );
+                break;
+            }
+        }
+    #endif /* if ( schedUSE_TCB_ARRAY == 1 ) */
+
+    return task;
+}
+
+void vPrintAllTaskNames()
+{
 }
