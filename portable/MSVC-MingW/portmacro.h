@@ -40,6 +40,10 @@
 #include <mmsystem.h>
 #include <winbase.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /******************************************************************************
 *   Defines
 ******************************************************************************/
@@ -184,8 +188,9 @@ void vPortExitCritical( void );
 #define portTASK_FUNCTION_PROTO( vFunction, pvParameters )    void vFunction( void * pvParameters )
 #define portTASK_FUNCTION( vFunction, pvParameters )          void vFunction( void * pvParameters )
 
-#define portINTERRUPT_YIELD    ( 0UL )
-#define portINTERRUPT_TICK     ( 1UL )
+#define portINTERRUPT_YIELD                        ( 0UL )
+#define portINTERRUPT_TICK                         ( 1UL )
+#define portINTERRUPT_APPLICATION_DEFINED_START    ( 2UL )
 
 /*
  * Raise a simulated interrupt represented by the bit mask in ulInterruptMask.
@@ -193,6 +198,14 @@ void vPortExitCritical( void );
  * two bits being used for the Yield and Tick interrupts respectively.
  */
 void vPortGenerateSimulatedInterrupt( uint32_t ulInterruptNumber );
+
+/*
+ * Raise a simulated interrupt represented by the bit mask in ulInterruptMask.
+ * Each bit can be used to represent an individual interrupt - with the first
+ * two bits being used for the Yield and Tick interrupts respectively. This function
+ * can be called in a windows thread.
+ */
+void vPortGenerateSimulatedInterruptFromWindowsThread( uint32_t ulInterruptNumber );
 
 /*
  * Install an interrupt handler to be called by the simulated interrupt handler
@@ -205,5 +218,9 @@ void vPortGenerateSimulatedInterrupt( uint32_t ulInterruptNumber );
  */
 void vPortSetInterruptHandler( uint32_t ulInterruptNumber,
                                uint32_t ( * pvHandler )( void ) );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ifndef PORTMACRO_H */

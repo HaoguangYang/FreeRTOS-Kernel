@@ -49,12 +49,6 @@
  */
 #include <stdint.h> /* READ COMMENT ABOVE. */
 
-/* *INDENT-OFF* */
-#ifdef __cplusplus
-    extern "C" {
-#endif
-/* *INDENT-ON* */
-
 /* Acceptable values for configTICK_TYPE_WIDTH_IN_BITS. */
 #define TICK_TYPE_WIDTH_16_BITS    0
 #define TICK_TYPE_WIDTH_32_BITS    1
@@ -128,6 +122,12 @@
     #include "picolibc-freertos.h"
 
 #endif /* if ( configUSE_PICOLIBC_TLS == 1 ) */
+
+/* *INDENT-OFF* */
+#ifdef __cplusplus
+    extern "C" {
+#endif
+/* *INDENT-ON* */
 
 #ifndef configUSE_C_RUNTIME_TLS_SUPPORT
     #define configUSE_C_RUNTIME_TLS_SUPPORT    0
@@ -619,6 +619,13 @@
 /* Called after a task has been selected to run.  pxCurrentTCB holds a pointer
  * to the task control block of the selected task. */
     #define traceTASK_SWITCHED_IN()
+#endif
+
+#ifndef traceSTARTING_SCHEDULER
+
+/* Called after all idle tasks and timer task (if enabled) have been created
+ * successfully, just before the scheduler is started. */
+    #define traceSTARTING_SCHEDULER( xIdleTaskHandles )
 #endif
 
 #ifndef traceINCREASE_TICK_COUNT

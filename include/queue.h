@@ -34,13 +34,13 @@
     #error "include FreeRTOS.h" must appear in source files before "include queue.h"
 #endif
 
+#include "task.h"
+
 /* *INDENT-OFF* */
 #ifdef __cplusplus
     extern "C" {
 #endif
 /* *INDENT-ON* */
-
-#include "task.h"
 
 /**
  * Type by which queues are referenced.  For example, a call to xQueueCreate()
@@ -71,11 +71,11 @@ typedef struct QueueDefinition   * QueueSetMemberHandle_t;
 
 /* For internal use only.  These definitions *must* match those in queue.c. */
 #define queueQUEUE_TYPE_BASE                  ( ( uint8_t ) 0U )
-#define queueQUEUE_TYPE_SET                   ( ( uint8_t ) 0U )
 #define queueQUEUE_TYPE_MUTEX                 ( ( uint8_t ) 1U )
 #define queueQUEUE_TYPE_COUNTING_SEMAPHORE    ( ( uint8_t ) 2U )
 #define queueQUEUE_TYPE_BINARY_SEMAPHORE      ( ( uint8_t ) 3U )
 #define queueQUEUE_TYPE_RECURSIVE_MUTEX       ( ( uint8_t ) 4U )
+#define queueQUEUE_TYPE_SET                   ( ( uint8_t ) 5U )
 
 /**
  * queue. h
